@@ -236,22 +236,77 @@ function Clamp {
 #  Extraction
 # ============================================================================================
 
-function Test-IsCab {
-    # True if the file starts with the MSCF cabinet signature.
-    param([string]$Path)
+function Get-FileHead {
+    # First N bytes of a file (for archive-format sniffing).
+    param([string]$Path, [int]$Count = 8)
     try {
         $fs = [System.IO.File]::OpenRead($Path)
         try {
-            $hdr = New-Object byte[] 4
-            $n = $fs.Read($hdr, 0, 4)
-            return ($n -eq 4 -and $hdr[0] -eq 0x4D -and $hdr[1] -eq 0x53 -and $hdr[2] -eq 0x43 -and $hdr[3] -eq 0x46)
+            $b = New-Object byte[] $Count
+            $n = $fs.Read($b, 0, $Count)
+            if ($n -lt $Count -and $n -gt 0) { $b = $b[0..($n - 1)] }
+            elseif ($n -le 0) { return @() }
+            return $b
         } finally { $fs.Close() }
-    } catch { return $false }
+    } catch { return @() }
+}
+
+function Extract-CabTo {
+    # Extract a CAB (MSCF) to $DestDir using a temp .cab copy + expand.exe, with the Windows shell
+    # cabinet handler as a fallback. Returns expand's text output.
+    param([string]$SrcPath, [string]$DestDir, [string]$FormName)
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ($FormName + '_' + ([System.IO.Path]::GetRandomFileName().Replace('.', '')) + '.cab')
+    $manifest = Join-Path $DestDir 'manifest.xsf'
+    $out = ''
+    try { Copy-Item -LiteralPath $SrcPath -Destination $tmp -Force } catch {}
+    if (Test-Path -LiteralPath $tmp) {
+        try { $out = & expand.exe $tmp '-F:*' $DestDir 2>&1 | Out-String } catch { $out = $_.Exception.Message }
+    }
+    if (-not (Test-Path -LiteralPath $manifest) -and (Test-Path -LiteralPath $tmp)) {
+        try {
+            $shell = New-Object -ComObject Shell.Application
+            $s = $shell.NameSpace([string]$tmp); $d = $shell.NameSpace([string]$DestDir)
+            if ($s -and $d) {
+                $d.CopyHere($s.Items(), 0x14)
+                for ($i = 0; $i -lt 75; $i++) { if (Test-Path -LiteralPath $manifest) { break }; Start-Sleep -Milliseconds 200 }
+            }
+        } catch {}
+    }
+    Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath (Join-Path $DestDir ([System.IO.Path]::GetFileName($tmp))) -Force -ErrorAction SilentlyContinue
+    return $out
+}
+
+function Extract-ZipTo {
+    # Extract a ZIP (PK..) to $DestDir using a temp .zip copy + Expand-Archive.
+    param([string]$SrcPath, [string]$DestDir, [string]$FormName)
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ($FormName + '_' + ([System.IO.Path]::GetRandomFileName().Replace('.', '')) + '.zip')
+    $out = ''
+    try {
+        Copy-Item -LiteralPath $SrcPath -Destination $tmp -Force
+        Expand-Archive -LiteralPath $tmp -DestinationPath $DestDir -Force -ErrorAction Stop
+    } catch { $out = $_.Exception.Message }
+    Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    return $out
+}
+
+function Flatten-Manifest {
+    # If manifest.xsf landed in a subfolder (some archives nest), copy that folder's files up to root.
+    param([string]$DestDir)
+    $manifest = Join-Path $DestDir 'manifest.xsf'
+    if (Test-Path -LiteralPath $manifest) { return }
+    $found = Get-ChildItem -LiteralPath $DestDir -Recurse -Filter 'manifest.xsf' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($found) {
+        try {
+            Get-ChildItem -LiteralPath $found.DirectoryName -File -ErrorAction SilentlyContinue | ForEach-Object {
+                Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $DestDir $_.Name) -Force
+            }
+        } catch {}
+    }
 }
 
 function Expand-Xsn {
     param([string]$XsnPath, [string]$DestDir)
-    # expand.exe -F:* needs the destination directory to ALREADY EXIST for a multi-file CAB.
     if (-not (Test-Path -LiteralPath $DestDir)) {
         New-Item -ItemType Directory -Path $DestDir -Force | Out-Null
     }
@@ -261,45 +316,24 @@ function Expand-Xsn {
     }
     $formName = [System.IO.Path]::GetFileNameWithoutExtension($XsnPath)
 
-    # The .xsn must be a real CAB (MSCF). If not, expand.exe would just copy it (which is exactly the
-    # "no manifest.xsf" symptom), so fail early with a clear reason.
-    if (-not (Test-IsCab $XsnPath)) {
-        Log-Issue $formName 'extract' 'Not a CAB cabinet (no MSCF header). The .xsn may be a OneDrive cloud-only stub (hydrate it: right-click > Always keep on this device), corrupt, or not an InfoPath template.' 'Error'
-        return $false
-    }
-
-    # expand.exe is finicky about extracting cabinets that do not have a .cab extension (it silently
-    # falls back to copying the whole file), so work from a temp .cab copy.
-    $tmpCab = Join-Path ([System.IO.Path]::GetTempPath()) ($formName + '_' + ([System.IO.Path]::GetRandomFileName().Replace('.', '')) + '.cab')
-    $out = ''
-    try { Copy-Item -LiteralPath $XsnPath -Destination $tmpCab -Force } catch {}
-
-    # Method 1: expand.exe with the documented "Source.cab -F:* Destination" order.
-    if (Test-Path -LiteralPath $tmpCab) {
-        try { $out = & expand.exe $tmpCab '-F:*' $DestDir 2>&1 | Out-String } catch { $out = $_.Exception.Message }
-    }
-
-    # Method 2 (fallback): the Windows shell cabinet handler, i.e. the same code path as double-
-    # clicking a .cab in Explorer. Works on cabinets expand.exe is fussy about.
-    if (-not (Test-Path -LiteralPath $manifest) -and (Test-Path -LiteralPath $tmpCab)) {
-        try {
-            $shell = New-Object -ComObject Shell.Application
-            $src = $shell.NameSpace([string]$tmpCab)
-            $dst = $shell.NameSpace([string]$DestDir)
-            if ($src -and $dst) {
-                $dst.CopyHere($src.Items(), 0x14)   # 0x10 = yes-to-all, 0x4 = no progress UI
-                for ($i = 0; $i -lt 75; $i++) { if (Test-Path -LiteralPath $manifest) { break }; Start-Sleep -Milliseconds 200 }
-            }
-        } catch {}
-    }
-
-    # Clean up: the temp cab, plus any stray copy expand may have dropped into the dest folder.
-    Remove-Item -LiteralPath $tmpCab -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath (Join-Path $DestDir ([System.IO.Path]::GetFileName($XsnPath))) -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath (Join-Path $DestDir ([System.IO.Path]::GetFileName($tmpCab))) -Force -ErrorAction SilentlyContinue
-
+    # Do NOT gate on the file header. A .xsn re-saved by InfoPath "Save As" can be a valid cabinet
+    # whose MSCF signature is not at byte 0 (renaming to .cab and extracting still works), so a strict
+    # header check is a false negative. Just attempt extraction: CAB first (copy to .cab + expand +
+    # shell handler, i.e. exactly what a manual .cab rename does), then ZIP as a fallback.
+    $out1 = Extract-CabTo -SrcPath $XsnPath -DestDir $DestDir -FormName $formName
+    Flatten-Manifest $DestDir
     if (Test-Path -LiteralPath $manifest) { return $true }
-    Log-Issue $formName 'extract' "Could not extract the cabinet with expand.exe or the shell. expand output: $(Clamp $out 300)" 'Error'
+
+    $out2 = Extract-ZipTo -SrcPath $XsnPath -DestDir $DestDir -FormName $formName
+    Flatten-Manifest $DestDir
+    if (Test-Path -LiteralPath $manifest) { return $true }
+
+    # Genuinely could not extract. Report the header bytes so the real format is identifiable.
+    $head = Get-FileHead $XsnPath 8
+    $hex = (@($head) | ForEach-Object { $_.ToString('X2') }) -join ' '
+    $asc = -join (@($head) | ForEach-Object { if ($_ -ge 32 -and $_ -lt 127) { [char]$_ } else { '.' } })
+    if (-not $hex) { $hex = '(empty / unreadable - likely a OneDrive cloud-only stub; hydrate it and re-run)' }
+    Log-Issue $formName 'extract' "Could not extract as CAB or ZIP. First bytes: [$hex] '$asc'. cab=$(Clamp $out1 120) zip=$(Clamp $out2 120)" 'Error'
     return $false
 }
 
