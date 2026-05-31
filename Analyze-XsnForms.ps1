@@ -236,10 +236,22 @@ function Clamp {
 #  Extraction
 # ============================================================================================
 
+function Test-IsCab {
+    # True if the file starts with the MSCF cabinet signature.
+    param([string]$Path)
+    try {
+        $fs = [System.IO.File]::OpenRead($Path)
+        try {
+            $hdr = New-Object byte[] 4
+            $n = $fs.Read($hdr, 0, 4)
+            return ($n -eq 4 -and $hdr[0] -eq 0x4D -and $hdr[1] -eq 0x53 -and $hdr[2] -eq 0x43 -and $hdr[3] -eq 0x46)
+        } finally { $fs.Close() }
+    } catch { return $false }
+}
+
 function Expand-Xsn {
     param([string]$XsnPath, [string]$DestDir)
-    # expand.exe -F:* needs the destination directory to ALREADY EXIST for a multi-file CAB,
-    # otherwise it errors with "Destination directory required for a multi-file CAB."
+    # expand.exe -F:* needs the destination directory to ALREADY EXIST for a multi-file CAB.
     if (-not (Test-Path -LiteralPath $DestDir)) {
         New-Item -ItemType Directory -Path $DestDir -Force | Out-Null
     }
@@ -248,18 +260,47 @@ function Expand-Xsn {
         return $true   # already extracted; idempotent re-run
     }
     $formName = [System.IO.Path]::GetFileNameWithoutExtension($XsnPath)
+
+    # The .xsn must be a real CAB (MSCF). If not, expand.exe would just copy it (which is exactly the
+    # "no manifest.xsf" symptom), so fail early with a clear reason.
+    if (-not (Test-IsCab $XsnPath)) {
+        Log-Issue $formName 'extract' 'Not a CAB cabinet (no MSCF header). The .xsn may be a OneDrive cloud-only stub (hydrate it: right-click > Always keep on this device), corrupt, or not an InfoPath template.' 'Error'
+        return $false
+    }
+
+    # expand.exe is finicky about extracting cabinets that do not have a .cab extension (it silently
+    # falls back to copying the whole file), so work from a temp .cab copy.
+    $tmpCab = Join-Path ([System.IO.Path]::GetTempPath()) ($formName + '_' + ([System.IO.Path]::GetRandomFileName().Replace('.', '')) + '.cab')
     $out = ''
-    try {
-        $out = & expand.exe '-F:*' $XsnPath $DestDir 2>&1 | Out-String
-    } catch {
-        Log-Issue $formName 'extract' "expand.exe failed: $($_.Exception.Message)" 'Error'
-        return $false
+    try { Copy-Item -LiteralPath $XsnPath -Destination $tmpCab -Force } catch {}
+
+    # Method 1: expand.exe with the documented "Source.cab -F:* Destination" order.
+    if (Test-Path -LiteralPath $tmpCab) {
+        try { $out = & expand.exe $tmpCab '-F:*' $DestDir 2>&1 | Out-String } catch { $out = $_.Exception.Message }
     }
-    if (-not (Test-Path -LiteralPath $manifest)) {
-        Log-Issue $formName 'extract' "Extraction produced no manifest.xsf. expand output: $(Clamp $out 300)" 'Error'
-        return $false
+
+    # Method 2 (fallback): the Windows shell cabinet handler, i.e. the same code path as double-
+    # clicking a .cab in Explorer. Works on cabinets expand.exe is fussy about.
+    if (-not (Test-Path -LiteralPath $manifest) -and (Test-Path -LiteralPath $tmpCab)) {
+        try {
+            $shell = New-Object -ComObject Shell.Application
+            $src = $shell.NameSpace([string]$tmpCab)
+            $dst = $shell.NameSpace([string]$DestDir)
+            if ($src -and $dst) {
+                $dst.CopyHere($src.Items(), 0x14)   # 0x10 = yes-to-all, 0x4 = no progress UI
+                for ($i = 0; $i -lt 75; $i++) { if (Test-Path -LiteralPath $manifest) { break }; Start-Sleep -Milliseconds 200 }
+            }
+        } catch {}
     }
-    return $true
+
+    # Clean up: the temp cab, plus any stray copy expand may have dropped into the dest folder.
+    Remove-Item -LiteralPath $tmpCab -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath (Join-Path $DestDir ([System.IO.Path]::GetFileName($XsnPath))) -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath (Join-Path $DestDir ([System.IO.Path]::GetFileName($tmpCab))) -Force -ErrorAction SilentlyContinue
+
+    if (Test-Path -LiteralPath $manifest) { return $true }
+    Log-Issue $formName 'extract' "Could not extract the cabinet with expand.exe or the shell. expand output: $(Clamp $out 300)" 'Error'
+    return $false
 }
 
 # ============================================================================================
