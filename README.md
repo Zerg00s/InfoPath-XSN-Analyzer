@@ -2,7 +2,7 @@
 
 A self-contained Windows PowerShell tool that inventories InfoPath form templates (`.xsn`) so you can plan a migration off InfoPath. For each form it extracts the template, parses the logic, data, dependencies and views, then writes a multi-sheet Excel workbook, a plain-text overview, and two Markdown files sized for an LLM. It does not perform the migration. It only reads and reports.
 
-It works on forms downloaded from SharePoint Server (on-premises) and SharePoint Online, and it handles both SharePoint **list** forms and form-**library** (XML) forms.
+It works on forms *downloaded* from SharePoint Server (on-premises) and SharePoint Online, and it handles both SharePoint **list** forms and form-**library** (XML) forms. This script does not talk to SharePoint at all, so it can be run by anyone with a copy of the XSN form files.
 
 ## What you need
 
@@ -63,20 +63,3 @@ At the root of the folder:
 | Blockers | Features with no clean migration path (code-behind, SQL, signatures, ActiveX, BCS, UDC, repeating sections, multiple attachments). |
 | Simplify | Dead or unused logic: disabled rules, empty rules, unwired rule sets, unused fields. |
 | Files | Every extracted file marked active or orphaned, with the reason. |
-
-## How a field is classified as SharePoint or XML
-
-List forms store every field as a SharePoint list column, so they are all marked `SharePoint column`. Library (XML) forms store the submission as an XML document, and only the fields that InfoPath promotes to columns (declared in `manifest.xsf`) are queryable columns. Everything else is marked `XML only`. The count of XML-only fields feeds the complexity score, because each one is extra work to surface during a migration.
-
-## The complexity score
-
-The score is a weighted sum that reflects rebuild effort, not just size. It counts views, sections, fields, complex fields (lookup / choice / person), repeating sections and fields, XML-only fields, attachment controls, data connections (with extra weight for SQL and cross-list connections), rules and conditions, on-load and field-change handlers, calculations, validation, read-only rules, view navigation, and a large fixed penalty for managed code-behind. The roll-up buckets each form as Low, Medium, High or Very High.
-
-## Safety
-
-The tool is read-only by design. It never writes to SharePoint and never modifies the source `.xsn` files. The only files it moves are junk files inside a folder it just extracted. SQL connection-string passwords are redacted everywhere they would otherwise appear.
-
-## Re-running
-
-Re-running is safe and idempotent. Extraction is skipped when a form is already unpacked, the reports are regenerated in place, and orphan handling is stable across runs. If a workbook is open in Excel (or being synced by OneDrive) when you re-run, the tool waits briefly, then leaves a fresh copy beside the locked file and notes it in the log rather than failing.
-"# InfoPath-XSN-Analyzer" 
