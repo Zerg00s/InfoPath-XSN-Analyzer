@@ -48,12 +48,6 @@ foreach ($xmlFile in $xmlFiles) {
 
     Write-Host "Processing: $($xmlFile.Name)" -ForegroundColor Cyan
 
-    # Subfolder named after the XML file, without extension
-    $subFolder = Join-Path $outputFolder $xmlFile.BaseName
-    if (-not (Test-Path $subFolder)) {
-        New-Item -Path $subFolder -ItemType Directory | Out-Null
-    }
-
     try {
         [xml]$xml = Get-Content -Path $xmlFile.FullName -Raw
     }
@@ -62,6 +56,8 @@ foreach ($xmlFile in $xmlFiles) {
         continue
     }
 
+    # Subfolder path is prepared, but NOT created yet
+    $subFolder = Join-Path $outputFolder $xmlFile.BaseName
     $count = 0
 
     # Walk every element that has a text value, test if it's an InfoPath attachment
@@ -79,6 +75,11 @@ foreach ($xmlFile in $xmlFiles) {
         $attachment = Get-InfoPathAttachment -Base64String $value
         if ($null -eq $attachment) { continue }
 
+        # Create the subfolder only when the first attachment is found
+        if (-not (Test-Path $subFolder)) {
+            New-Item -Path $subFolder -ItemType Directory | Out-Null
+        }
+
         # Handle duplicate filenames inside the same XML
         $targetPath = Join-Path $subFolder $attachment.FileName
         $i = 1
@@ -95,7 +96,7 @@ foreach ($xmlFile in $xmlFiles) {
     }
 
     if ($count -eq 0) {
-        Write-Host "  No attachments found." -ForegroundColor Yellow
+        Write-Host "  No attachments found, no folder created." -ForegroundColor Yellow
     }
 }
 
